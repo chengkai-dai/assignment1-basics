@@ -9,6 +9,105 @@ import numpy.typing as npt
 import torch
 from torch import Tensor
 
+import regex
+import multiprocessing as mp
+from collections import defaultdict, Counter
+from concurrent.futures import ProcessPoolExecutor
+
+
+def find_chunk_boundaries(
+    file: IO, 
+    desired_num_chunks: int, 
+    split_special_token: bytes
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), (
+        "Must represent special token as a bytestring"
+    )
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
+
+
+def _process_chunk_for_bpe(args):
+    """Process a chunk of text for BPE training. Must be at module level for multiprocessing."""
+    start, end, input_path, special_tokens = args
+    
+    # Regex pattern for pre-tokenization
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    
+    chunk_counts = Counter()
+    
+    with open(input_path, 'rb') as f:
+        f.seek(start)
+        chunk_data = f.read(end - start)
+        
+    text = chunk_data.decode('utf-8')
+    
+    # Split on special tokens to preserve them
+    if special_tokens:
+        # Create pattern to split on special tokens while preserving them
+        special_pattern = '|'.join(regex.escape(token) for token in special_tokens)
+        parts = regex.split(f'({special_pattern})', text)
+    else:
+        parts = [text]
+    
+    for part in parts:
+        if not part:
+            continue
+            
+                # Check if this part is a special token
+        if part in special_tokens:
+            # Skip special tokens - they don't participate in BPE training
+            # but are already in vocabulary with pre-assigned IDs
+            continue
+        else:
+            # Pre-tokenize this part using regex
+            tokens = regex.findall(PAT, part)
+            for token in tokens:
+                if token:  # Skip empty tokens
+                    # Convert to bytes and then to individual byte tokens
+                    token_bytes = token.encode('utf-8')
+                    byte_tokens = tuple(bytes([b]) for b in token_bytes)
+                    chunk_counts[byte_tokens] += 1
+    
+    return chunk_counts
+
 
 
 def run_linear(
@@ -588,4 +687,105 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    # Initialize vocabulary with special tokens first, then all 256 byte values
+    vocab = {}
+    next_id = 0
+    
+    # Add special tokens to vocabulary
+    for special_token in special_tokens:
+        vocab[next_id] = special_token.encode('utf-8')
+        next_id += 1
+    
+    # Add all 256 possible byte values to vocabulary
+    for byte_val in range(256):
+        vocab[next_id] = bytes([byte_val])
+        next_id += 1
+
+    
+    # Get chunk boundaries for multiprocessing
+    num_processes = mp.cpu_count()
+    
+    with open(input_path, 'rb') as f:
+        # Use first special token for boundary detection if available
+        split_token = special_tokens[0].encode('utf-8') if special_tokens else b'\n'
+        boundaries = find_chunk_boundaries(f, num_processes, split_token)
+
+    print(boundaries)
+
+    
+    # Create arguments for each chunk
+    chunk_args = []
+    for i in range(len(boundaries) - 1):
+        start, end = boundaries[i], boundaries[i + 1]
+        chunk_args.append((start, end, input_path, special_tokens))
+    
+    # Process chunks in parallel
+    with ProcessPoolExecutor(max_workers=num_processes) as executor:
+        chunk_results = list(executor.map(_process_chunk_for_bpe, chunk_args))
+    
+    # Merge counts from all chunks
+    word_counts = Counter()
+    for chunk_counts in chunk_results:
+        word_counts.update(chunk_counts)
+    
+    # Function to get all adjacent pairs in a word
+    def get_pairs(word):
+        pairs = set()
+        if len(word) < 2:
+            return pairs
+        for i in range(len(word) - 1):
+            pairs.add((word[i], word[i + 1]))
+        return pairs
+    
+    # Function to merge a specific pair in a word
+    def merge_word(word, pair):
+        new_word = []
+        i = 0
+        while i < len(word):
+            if i < len(word) - 1 and word[i] == pair[0] and word[i + 1] == pair[1]:
+                # Merge the pair
+                merged = word[i] + word[i + 1]
+                new_word.append(merged)
+                i += 2
+            else:
+                new_word.append(word[i])
+                i += 1
+        return tuple(new_word)
+    
+    merges = []
+    
+    # # Main BPE training loop
+    num_merges = vocab_size - len(vocab)  # How many merges we need to do
+    
+    for _ in range(num_merges):
+        # Count all pairs
+        pair_counts = Counter()
+        
+        for word, count in word_counts.items():
+            pairs = get_pairs(word)
+            for pair in pairs:
+                pair_counts[pair] += count
+        
+        if not pair_counts:
+            break
+
+        # In case of ties, pick the lexicographically greatest pair
+        best_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
+        
+        # Add this merge to our list
+        merges.append(best_pair)
+        
+        # Add merged token to vocabulary
+        merged_token = best_pair[0] + best_pair[1]
+        vocab[next_id] = merged_token
+        next_id += 1
+        
+        # Update word counts by applying this merge
+        new_word_counts = Counter()
+        for word, count in word_counts.items():
+            new_word = merge_word(word, best_pair)
+            new_word_counts[new_word] += count
+        
+        word_counts = new_word_counts    
+    
+    return vocab, merges

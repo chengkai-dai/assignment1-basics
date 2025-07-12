@@ -725,6 +725,7 @@ def run_train_bpe(
     
     # Merge counts from all chunks
     word_counts = Counter()
+    print(len(chunk_results))
     for chunk_counts in chunk_results:
         word_counts.update(chunk_counts)
     
@@ -756,6 +757,42 @@ def run_train_bpe(
     
     # # Main BPE training loop
     num_merges = vocab_size - len(vocab)  # How many merges we need to do
+
+    # Find the indices for 'o' and 'u'
+    o_index = None
+    u_index = None
+    i_index = None
+    t_index = None
+    
+    for idx, token in vocab.items():
+        if token == b'o':
+            o_index = idx
+        elif token == b'u':
+            u_index = idx
+        elif token == b'i':
+            i_index = idx
+        elif token == b't':
+            t_index = idx
+        elif token == b'h':
+            h_index = idx
+        elif token == b'e':
+            e_index = idx
+    
+    # Count pairs in the initial word_counts
+    initial_pair_counts = Counter()
+    for word, count in word_counts.items():
+        pairs = get_pairs(word)
+        for pair in pairs:
+            initial_pair_counts[pair] += count
+    
+    if o_index is not None and u_index is not None:
+        print(f"Count for ('o','u'): {initial_pair_counts.get((vocab[o_index], vocab[u_index]), 0)}")
+    
+    if i_index is not None and t_index is not None:
+        print(f"Count for ('i','t'): {initial_pair_counts.get((vocab[i_index], vocab[t_index]), 0)}")
+    
+    if h_index is not None and e_index is not None:
+        print(f"Count for ('h','e'): {initial_pair_counts.get((vocab[h_index], vocab[e_index]), 0)}")
     
     for _ in range(num_merges):
         # Count all pairs
@@ -771,6 +808,8 @@ def run_train_bpe(
 
         # In case of ties, pick the lexicographically greatest pair
         best_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
+
+        print(f"Max pair: {best_pair[0].decode('utf-8', errors='replace')} + {best_pair[1].decode('utf-8', errors='replace')} (count: {pair_counts[best_pair]})")
         
         # Add this merge to our list
         merges.append(best_pair)

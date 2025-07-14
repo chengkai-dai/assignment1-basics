@@ -86,6 +86,8 @@ def _process_chunk_for_bpe(args):
         parts = regex.split(f'({special_pattern})', text)
     else:
         parts = [text]
+
+    pretokens = []
     
     for part in parts:
         if not part:
@@ -105,7 +107,6 @@ def _process_chunk_for_bpe(args):
                     token_bytes = token.encode('utf-8')
                     byte_tokens = tuple(bytes([b]) for b in token_bytes)
                     chunk_counts[byte_tokens] += 1
-    
     return chunk_counts
 
 
@@ -710,8 +711,6 @@ def run_train_bpe(
         split_token = special_tokens[0].encode('utf-8') if special_tokens else b'\n'
         boundaries = find_chunk_boundaries(f, num_processes, split_token)
 
-    print(boundaries)
-
     
     # Create arguments for each chunk
     chunk_args = []
@@ -722,20 +721,19 @@ def run_train_bpe(
     # Process chunks in parallel
     with ProcessPoolExecutor(max_workers=num_processes) as executor:
         chunk_results = list(executor.map(_process_chunk_for_bpe, chunk_args))
-    
+
     # Merge counts from all chunks
     word_counts = Counter()
-    print(len(chunk_results))
     for chunk_counts in chunk_results:
         word_counts.update(chunk_counts)
     
-    # Function to get all adjacent pairs in a word
+    # Function to get all adjacent pairs in a word with their counts
     def get_pairs(word):
-        pairs = set()
+        pairs = Counter()
         if len(word) < 2:
             return pairs
         for i in range(len(word) - 1):
-            pairs.add((word[i], word[i + 1]))
+            pairs[(word[i], word[i + 1])] += 1
         return pairs
     
     # Function to merge a specific pair in a word
@@ -758,41 +756,6 @@ def run_train_bpe(
     # # Main BPE training loop
     num_merges = vocab_size - len(vocab)  # How many merges we need to do
 
-    # Find the indices for 'o' and 'u'
-    o_index = None
-    u_index = None
-    i_index = None
-    t_index = None
-    
-    for idx, token in vocab.items():
-        if token == b'o':
-            o_index = idx
-        elif token == b'u':
-            u_index = idx
-        elif token == b'i':
-            i_index = idx
-        elif token == b't':
-            t_index = idx
-        elif token == b'h':
-            h_index = idx
-        elif token == b'e':
-            e_index = idx
-    
-    # Count pairs in the initial word_counts
-    initial_pair_counts = Counter()
-    for word, count in word_counts.items():
-        pairs = get_pairs(word)
-        for pair in pairs:
-            initial_pair_counts[pair] += count
-    
-    if o_index is not None and u_index is not None:
-        print(f"Count for ('o','u'): {initial_pair_counts.get((vocab[o_index], vocab[u_index]), 0)}")
-    
-    if i_index is not None and t_index is not None:
-        print(f"Count for ('i','t'): {initial_pair_counts.get((vocab[i_index], vocab[t_index]), 0)}")
-    
-    if h_index is not None and e_index is not None:
-        print(f"Count for ('h','e'): {initial_pair_counts.get((vocab[h_index], vocab[e_index]), 0)}")
     
     for _ in range(num_merges):
         # Count all pairs
@@ -800,16 +763,14 @@ def run_train_bpe(
         
         for word, count in word_counts.items():
             pairs = get_pairs(word)
-            for pair in pairs:
-                pair_counts[pair] += count
+            for pair, pair_count in pairs.items():
+                pair_counts[pair] += pair_count * count
         
         if not pair_counts:
             break
 
         # In case of ties, pick the lexicographically greatest pair
         best_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
-
-        print(f"Max pair: {best_pair[0].decode('utf-8', errors='replace')} + {best_pair[1].decode('utf-8', errors='replace')} (count: {pair_counts[best_pair]})")
         
         # Add this merge to our list
         merges.append(best_pair)

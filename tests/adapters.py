@@ -14,6 +14,7 @@ import multiprocessing as mp
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from cs336_basics.Tokeizer import Tokenizer
+from cs336_basics.Linear import Linear
 
 def find_chunk_boundaries(
     file: IO, 
@@ -128,8 +129,9 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    linear = Linear(d_in, d_out)
+    linear.weight.data = weights
+    return linear(in_features)
 
 
 def run_embedding(

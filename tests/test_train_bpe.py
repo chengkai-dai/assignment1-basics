@@ -5,24 +5,23 @@ from .adapters import run_train_bpe
 from .common import FIXTURES_PATH, gpt2_bytes_to_unicode
 
 
-# def test_train_bpe_speed():
-#     """
-#     Ensure that BPE training is relatively efficient by measuring training
-#     time on this small dataset and throwing an error if it takes more than 1.5 seconds.
-#     This is a pretty generous upper-bound, it takes 0.38 seconds with the
-#     reference implementation on my laptop. In contrast, the toy implementation
-#     takes around 3 seconds.
-#     """
-#     input_path = FIXTURES_PATH / "corpus.en"
-#     start_time = time.time()
-#     _, _ = run_train_bpe(
-#         input_path=input_path,
-#         vocab_size=500,
-#         special_tokens=["<|endoftext|>"],
-#     )
-#     end_time = time.time()
-#     print(f"BPE training time: {end_time - start_time:.2f} seconds")
-#     assert end_time - start_time < 1.5
+def test_train_bpe_speed():
+    """
+    Ensure that BPE training is relatively efficient by measuring training
+    time on this small dataset and throwing an error if it takes more than 1.5 seconds.
+    This is a pretty generous upper-bound, it takes 0.38 seconds with the
+    reference implementation on my laptop. In contrast, the toy implementation
+    takes around 3 seconds.
+    """
+    input_path = FIXTURES_PATH / "corpus.en"
+    start_time = time.time()
+    _, _ = run_train_bpe(
+        input_path=input_path,
+        vocab_size=500,
+        special_tokens=["<|endoftext|>"],
+    )
+    end_time = time.time()
+    assert end_time - start_time < 1.5
 
 
 def test_train_bpe():
@@ -48,10 +47,6 @@ def test_train_bpe():
             )
             for merge_token_1, merge_token_2 in gpt2_reference_merges
         ]
-    # print("merges")
-    # print(merges)
-    # print("reference_merges")
-    # print(reference_merges)
     assert merges == reference_merges
 
     # Compare the vocab to the expected output vocab

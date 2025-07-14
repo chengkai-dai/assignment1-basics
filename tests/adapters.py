@@ -11,9 +11,9 @@ from torch import Tensor
 
 import regex
 import multiprocessing as mp
-from collections import defaultdict, Counter
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
-
+import time
 
 def find_chunk_boundaries(
     file: IO, 
@@ -34,7 +34,6 @@ def find_chunk_boundaries(
     file.seek(0)
 
     chunk_size = file_size // desired_num_chunks
-
     # Initial guesses for chunk boundary locations, uniformly spaced
     # Chunks start on previous index, don't include last index
     chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
@@ -702,15 +701,13 @@ def run_train_bpe(
         vocab[next_id] = bytes([byte_val])
         next_id += 1
 
-    
     # Get chunk boundaries for multiprocessing
     num_processes = mp.cpu_count()
-    
+
     with open(input_path, 'rb') as f:
         # Use first special token for boundary detection if available
         split_token = special_tokens[0].encode('utf-8') if special_tokens else b'\n'
         boundaries = find_chunk_boundaries(f, num_processes, split_token)
-
     
     # Create arguments for each chunk
     chunk_args = []
@@ -727,65 +724,100 @@ def run_train_bpe(
     for chunk_counts in chunk_results:
         word_counts.update(chunk_counts)
     
-    # Function to get all adjacent pairs in a word with their counts
     def get_pairs(word):
-        pairs = Counter()
-        if len(word) < 2:
-            return pairs
+        """Extract all adjacent pairs from a word with their counts"""
+        pairs = {}
         for i in range(len(word) - 1):
-            pairs[(word[i], word[i + 1])] += 1
+            pair = (word[i], word[i + 1])
+            pairs[pair] = pairs.get(pair, 0) + 1
         return pairs
     
-    # Function to merge a specific pair in a word
     def merge_word(word, pair):
+        """Merge a pair in a word"""
+        if len(word) < 2:
+            return word
+        
         new_word = []
         i = 0
+        target_a, target_b = pair
+        merged = target_a + target_b
+        
         while i < len(word):
-            if i < len(word) - 1 and word[i] == pair[0] and word[i + 1] == pair[1]:
-                # Merge the pair
-                merged = word[i] + word[i + 1]
+            if i < len(word) - 1 and word[i] == target_a and word[i + 1] == target_b:
                 new_word.append(merged)
                 i += 2
             else:
                 new_word.append(word[i])
                 i += 1
         return tuple(new_word)
-    
+
     merges = []
+    num_merges = vocab_size - len(vocab)
     
-    # # Main BPE training loop
-    num_merges = vocab_size - len(vocab)  # How many merges we need to do
-
+    # Pre-compute all pairs and their global counts
+    global_pairs = {}
+    word_pairs_cache = {}
     
+    for word, count in word_counts.items():
+        pairs = get_pairs(word)
+        word_pairs_cache[word] = pairs
+        for pair, pair_count in pairs.items():
+            global_pairs[pair] = global_pairs.get(pair, 0) + pair_count * count
+    
+    # Main BPE training loop
     for _ in range(num_merges):
-        # Count all pairs
-        pair_counts = Counter()
-        
-        for word, count in word_counts.items():
-            pairs = get_pairs(word)
-            for pair, pair_count in pairs.items():
-                pair_counts[pair] += pair_count * count
-        
-        if not pair_counts:
+        if not global_pairs:
             break
-
-        # In case of ties, pick the lexicographically greatest pair
-        best_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
         
-        # Add this merge to our list
+        best_pair = max(global_pairs.items(), key=lambda x: (x[1], x[0]))[0]
+        
+        # Add merge to list
         merges.append(best_pair)
         
         # Add merged token to vocabulary
-        merged_token = best_pair[0] + best_pair[1]
-        vocab[next_id] = merged_token
+        vocab[next_id] = best_pair[0] + best_pair[1]
         next_id += 1
         
-        # Update word counts by applying this merge
-        new_word_counts = Counter()
-        for word, count in word_counts.items():
-            new_word = merge_word(word, best_pair)
-            new_word_counts[new_word] += count
+        # Efficiently update word counts and pair counts
+        new_word_counts = {}
+        new_word_pairs_cache = {}
         
-        word_counts = new_word_counts    
+        # Track changes to global pairs
+        pair_changes = {}
+        
+        for word, count in word_counts.items():
+            old_pairs = word_pairs_cache[word]
+            
+            # Check if word contains the pair to merge
+            if best_pair in old_pairs:
+                # Merge the word
+                new_word = merge_word(word, best_pair)
+                new_word_counts[new_word] = count
+                
+                # Calculate new pairs
+                new_pairs = get_pairs(new_word)
+                new_word_pairs_cache[new_word] = new_pairs
+                
+                # Update pair changes
+                for pair, pair_count in old_pairs.items():
+                    pair_changes[pair] = pair_changes.get(pair, 0) - pair_count * count
+                
+                for pair, pair_count in new_pairs.items():
+                    pair_changes[pair] = pair_changes.get(pair, 0) + pair_count * count
+            else:
+                # Word unchanged
+                new_word_counts[word] = count
+                new_word_pairs_cache[word] = old_pairs
+        
+        # Apply pair changes to global counts
+        for pair, change in pair_changes.items():
+            new_count = global_pairs.get(pair, 0) + change
+            if new_count > 0:
+                global_pairs[pair] = new_count
+            else:
+                global_pairs.pop(pair, None)
+        
+        word_counts = new_word_counts
+        word_pairs_cache = new_word_pairs_cache
     
     return vocab, merges
